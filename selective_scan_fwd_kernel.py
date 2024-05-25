@@ -1,4 +1,3 @@
-import dataclasses
 import torch
 from dataclasses import dataclass
 from .kernel_object import threadIdx, blockIdx
@@ -15,22 +14,30 @@ class Selective_Scan_fwd_kernel_traits:
     kNThreads: int
     kNItems: int
     kIsEvenLen: bool
-    isVariableB: bool
-    isVariableC: bool
-    kHasZ: bool
+    isVariableB: bool = True
+    isVariableC: bool = True
+    kHasZ: bool = True
 
-    input_t: torch.dtype
-    weight_t: torch.dtype
+    input_t: torch.dtype | None = None
+    weight_t: torch.dtype | None = None
 
     # In the original code, we need to determine the amount of shared memory which will be used by each block in the kernel.
     # In order to do a selective scan, each block needs some memory set aside to communicate with other threads within the block.
     # The shared memory is partitioned into several parts, i/o, BlockScan, running_prefix.
     # They calculate the offset of each parition.
+    BlockLoadInputT_mem: int = 0
+    BlockLoadWeightT_mem: int = 0
+    BlockStoreInputT_mem: int = 0
+    BlockScanT_mem: int = 0
 
     # For example given that i/o take up 2 bytes, block scan take up 4 bytes, and running_prefix takes up 4 bytes,
     # then we would have a shared memory size of 10 bytes, and would have an offset of the following
-    kSmemIOSize: int = 2
-    kSmemSize: int = 4 + kSmemIOSize
+    kSmemIOSize: int = max(
+        BlockLoadInputT_mem,
+        BlockLoadWeightT_mem * (isVariableB + isVariableC),
+        BlockStoreInputT_mem,
+    )
+    kSmemSize: int = kSmemIOSize + BlockScanT_mem
     # This would capture the offset for each partition
 
     # In the original code, they look at this size of the pointer, for simplicity we'll just set it to false
@@ -79,14 +86,14 @@ class selective_scan_fwd_kernel:
 
         # Even though we don't need shared memory, I will fake create it here to show
         # how this looks like in memory
-        smem_load = self.smem_[: self.Ktraits.kSmemIOSize]
+        smem_load = self.smem_[: self.Ktraits.BlockLoadInputT_mem]
         # If we have both B and C as variable, then we store them in different parts of shared memory
         # so that we don't have to __syncthreads() between loading them
-        smem_load_weight = self.smem_[: self.Ktraits.kSmemIOSize]
+        smem_load_weight = self.smem_[: self.Ktraits.BlockLoadWeightT_mem]
         smem_load_weight1 = self.smem_[
-            self.Ktraits.kSmemIOSize : self.Ktraits.kSmemIOSize
+            self.Ktraits.BlockLoadWeightT_mem : 2 * self.Ktraits.BlockLoadWeightT_mem
         ]
-        smem_store = self.smem_[: self.Ktraits.kSmemIOSize]
+        smem_store = self.smem_[: self.Ktraits.BlockStoreInputT_mem]
         smem_scan = self.smem_[self.Ktraits.kSmemIOSize : self.Ktraits.kSmemSize]
 
         smem_running_prefix = self.smem_[self.Ktraits.kSmemSize :]
@@ -237,6 +244,12 @@ class selective_scan_fwd_kernel:
                 if threadIdx.x == 0:  # So only one thread stores the value
                     smem_running_prefix[2 * state_idx] = prefix_op.running_prefix[0]
                     smem_running_prefix[2 * state_idx + 1] = prefix_op.running_prefix[1]
+
+                    # Store the aggregate value for the entire chunk
+                    # This is used in the backward pass to optimize the computation
+                    # for calculating the gradients of delta
+                    x[chunk, state_idx][0] = prefix_op.running_prefix[0]
+                    x[chunk, state_idx][1] = prefix_op.running_prefix[1]
 
                 # multiply by C and write to output
                 for i in range(0, kNItems, 1):

@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+""" These are Native to the CUDA Language, so not really seen as an object"""
+
 
 @dataclass
 class threadIdx:

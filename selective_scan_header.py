@@ -41,3 +41,23 @@ class SelectiveScanParams:
     # will have our signal in memory, might as well use it
     z: torch.Tensor
     z_out: torch.Tensor
+
+
+@dataclass
+class SSMParamsBwd(SelectiveScanParams):
+    # Incoming gradients
+    dout: torch.Tensor
+
+    # Outgoing Gradients
+    dA: torch.Tensor
+    dB: torch.Tensor
+    dC: torch.Tensor
+    dD: torch.Tensor
+
+    # Outgoing Signal Gradients
+    du: torch.Tensor
+    dz: torch.Tensor
+
+    # Outgoing Delta Gradients
+    ddelta: torch.Tensor
+    ddelta_bias: torch.Tensor
