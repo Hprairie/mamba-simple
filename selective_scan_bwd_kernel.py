@@ -129,6 +129,7 @@ class selective_scan_bwd_kernel:
         smem_reverse_scan = self.smem_
 
         # Shared memory for constants
+        # smem_delta_a
 
         # This isn't real python and would throw an error, but we are mimicking pointers in c++
         u = params.u[batch_id, dim_id]  # This is now a 1D tensor [seqLen]
@@ -170,12 +171,14 @@ class selective_scan_bwd_kernel:
             delta_vals_load = torch.Tensor([0] * kNItems)
             dout_vals_load = torch.Tensor([0] * kNItems)
 
+            # Load values into the temporary variables (These are thread specific)
             load_input(u, u_vals, smem_load, params.seqLen - chunk * kNItems)
             load_input(
                 delta, delta_vals_load, smem_load, params.seqLen - chunk * kNItems
             )
             load_input(dout, dout_vals_load, smem_load, params.seqLen - chunk * kNItems)
 
+            # Create more temporary variables to store delta and dout
             dout_vals = torch.Tensor([0] * kNItems)
             delta_vals = torch.Tensor([0] * kNItems)
             for i in range(kNItems):
@@ -197,6 +200,124 @@ class selective_scan_bwd_kernel:
                 # Temporary variables to store the values of z and out on the thread
                 z_vals = torch.Tensor([0] * kNItems)
                 out_vals = torch.Tensor([0] * kNItems)
+
+                # Load values into the temporary variables
+                load_input(z, z_vals, smem_load, params.seqLen - chunk * kNItems)
+                # __syncthreads() # We don't want to overwrite smem_load memory
+                load_input(out, out_vals, smem_load, params.seqLen - chunk * kNItems)
+
+                # Temporary variables to store the values of dz and z_silu on the thread
+                dz_vals = torch.Tensor([0] * kNItems)
+                # We will reuse z_silu_vals that's why we store them here
+                z_silu_vals = torch.Tensor([0] * kNItems)
+                for i in range(kNItems):
+                    # Get the z val for each item in the thread and calculate it's sigmoid
+                    z_val = z_vals[i]
+                    z_sigmoid_val = 1 / (1 + torch.exp(-z_val))
+
+                    # Calculate the dz value
+                    # Remember that the derivative of the SiLU function is: sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+                    # Thus dout/dz = out * sigmoid(z) * (1 + z * (1 - sigmoid(z)))
+                    z_silu_vals[i] = z_val * z_sigmoid_val
+                    dz_vals[i] = (
+                        dout_vals[i]
+                        * out_vals[i]
+                        * z_sigmoid_val
+                        * (1 + z_val * (1 - z_sigmoid_val))
+                    )
+
+                    # Also note that since silu is out * SiLU(z), then for gradients to flow
+                    # though dout, we need to multiply by SiLU(z) as well. (Think gating function)
+                    dout_vals[i] *= z_silu_vals[i]
+
+                # Now that we calculated dz vals, we can store them
+                store_input(dz, dz_vals, smem_store, params.seqLen - chunk * kNItems)
+
+                # Why do they recalculate out_z_vals here?
+
+            # Before we get started on calculating the gradients throught the backward pass,
+            # if we have a D value, we need to calculate the gradients for it, and then also
+            # pass gradients thought to u
+
+            # This will be used to store the gradients for u
+            du_vals = torch.Tensor([0] * kNItems)
+
+            for i in range(kNItems):
+                du_vals[i] = dout_vals[i] * D_val
+                dD_val += dout_vals[i] * u_vals[i]
+                # Note as D is not selective, we accumulate the gradients for it
+
+            # Create a temporary store for the gradients of delta
+            ddelta_vals = torch.Tensor([0] * kNItems)
+
+            # Like the forward process of selective scan, since A is diagonal, then
+            # we will calculate the gradients for each rank independently
+            for stateIdx in range(params.dstate):
+                A_val = A[stateIdx]  # Grab the A value for this rank
+
+                # Create temporary local storage B_vals and C_vals for this rank
+                B_vals = torch.Tensor([0] * kNItems)
+                C_vals = torch.Tensor([0] * kNItems)
+
+                # Load the B and C values for this rank
+                if kIsVariableB:
+                    load_weight(Bvar[stateIdx], B_vals, smem_load_weight, 0)
+                else:
+                    B_vals = B[stateIdx]
+
+                if kIsVariableC:
+                    load_weight(Cvar[stateIdx], C_vals, smem_load_weight1, 0)
+                else:
+                    C_vals = C[stateIdx]
+
+                # These will be used to store values which we are going to run a
+                # selective scan on
+                # We will preprocess gradient streams and then load the values to be
+                # scanned into these parameters. Then just run selective scan
+                thread_data = torch.Tensor([0] * kNItems)
+                thread_reverse_data = torch.Tensor([0] * kNItems)
+                if kIsComplex:
+                    # In order to calculate the gradients for delta, we need the hidden state
+                    # This is why we are doing two selective scans. The first one is a prefix
+                    # scan which will be used to recalculate the hidden states, and the second
+                    # one is a postfix scan which will be used to calculate the gradients for everything else
+
+                    # Let's first load the correct values into thread_data
+                    # and thread_reverse_data
+                    for i in range(kNItems):
+                        # We need to recalculate exp(delta * A) for each item
+                        delta_a_exp = torch.exp(delta_vals[i] * A_val)
+
+                        # This is the same as the forward pass
+                        thread_data[i][0] = delta_vals[i] * A_val
+                        thread_data[i][1] = (
+                            delta_vals[i] * B_vals[i] * u_vals[i]
+                            if kIsVariableB
+                            else delta_vals[i] * u_vals[i]
+                        )
+
+                        # We have the data loaded into thread_data, now we need to load data
+                        # into reverse thread data.
+
+                        # First recognize that the backward pass will look something like this for a sequence of length 3
+                        # dh_0 = dout_0 + dout_1 * A_1 + dout_2 * A_2 * A_1
+                        # dh_1 = dout_1 + dout_2 * A_2
+                        # dh_2 = dout_2
+
+                        # We can see that this is just the same selective scan as the forward pass, but in the reverse order
+                        # of the sequence. One maybe not so obvious difference is that we need to shift the values of A to
+                        # the left by one for the reverse scan in comparison to the forward scan.
+
+                        # I would take a close look at what is in the values of both the forward and reverse scan's if you are confused
+
+                        if i == 0:
+                            pass
+
+                        # This is new code for passing the gradients backward
+
+                else:
+                    # The same thing as the real case but with complex numbers
+                    pass
 
 
 #  ------------------- selective_scan_bwd_launch -------------------
