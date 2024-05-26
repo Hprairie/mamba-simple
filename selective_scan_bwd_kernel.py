@@ -128,8 +128,18 @@ class selective_scan_bwd_kernel:
         smem_scan = self.smem_
         smem_reverse_scan = self.smem_
 
-        # Shared memory for constants
-        # smem_delta_a
+        # ----- Shared memory for constants -----
+
+        # Go down to where we are calculate delta * A to see how and why we are using this
+        smem_delta_a = self.smem_[
+            self.Ktraits.kSmemSize : self.Ktraits.kSmemSize
+            + kNThreads
+            + 2 * params.dstate
+        ]
+
+        # postfix memory
+        smem_running_postfix = self.smem_  # I got lazy here but you get the point
+        # This will store params.dstate amount of values, which are the postfix values for the next block
 
         # This isn't real python and would throw an error, but we are mimicking pointers in c++
         u = params.u[batch_id, dim_id]  # This is now a 1D tensor [seqLen]
@@ -248,6 +258,7 @@ class selective_scan_bwd_kernel:
                 # Note as D is not selective, we accumulate the gradients for it
 
             # Create a temporary store for the gradients of delta
+            # We use this at the end of the loop
             ddelta_vals = torch.Tensor([0] * kNItems)
 
             # Like the forward process of selective scan, since A is diagonal, then
@@ -256,6 +267,7 @@ class selective_scan_bwd_kernel:
                 A_val = A[stateIdx]  # Grab the A value for this rank
 
                 # Create temporary local storage B_vals and C_vals for this rank
+                B_val, C_val = 0, 0
                 B_vals = torch.Tensor([0] * kNItems)
                 C_vals = torch.Tensor([0] * kNItems)
 
@@ -263,12 +275,12 @@ class selective_scan_bwd_kernel:
                 if kIsVariableB:
                     load_weight(Bvar[stateIdx], B_vals, smem_load_weight, 0)
                 else:
-                    B_vals = B[stateIdx]
+                    B_val = B[stateIdx]
 
                 if kIsVariableC:
                     load_weight(Cvar[stateIdx], C_vals, smem_load_weight1, 0)
                 else:
-                    C_vals = C[stateIdx]
+                    C_val = C[stateIdx]
 
                 # These will be used to store values which we are going to run a
                 # selective scan on
@@ -311,9 +323,124 @@ class selective_scan_bwd_kernel:
                         # I would take a close look at what is in the values of both the forward and reverse scan's if you are confused
 
                         if i == 0:
-                            pass
+                            smem_delta_a[
+                                (
+                                    stateIdx + (chunk % 2) * params.dstate
+                                    if threadIdx.x == 0
+                                    else threadIdx.x + 2 * params.dstate
+                                )
+                            ] = delta_a_exp
+                        else:
+                            thread_reverse_data[i - 1][0] = delta_a_exp
 
-                        # This is new code for passing the gradients backward
+                        # Alright I'll try to explain what is happening in the above snippet. Now that we know that we need to shift
+                        # the values of A to the left by one for the reverse scan, it would be much better to use shared memory to
+                        # shift the values of A to the left, rather then going to memory.
+
+                        # The memory layout of smem_delta_a is as follows:
+                        # Section 1: size is (2 * params.dstate)
+                        #    - Here we store the values of exp(delta * A) which are stored in threadIdx.x == 0
+                        #    - This should be the A values that are needed in the next chunk
+                        #    - So rather than recompute them, we store them in shared memory
+                        #    - The modulo operation is used to switch between two sections of memory
+                        #      so that we do not overite our current values as they will be needed in our current chunk
+                        #    - Thus we have an active section which our current chunk is using and a future chunk,
+                        #      which the next chunk will use
+                        # Section 2: size is the number of threads in our block
+                        #    - Here we store the values of exp(delta * A) which we will use to shift for our current block
+
+                        # We then calculate y for the selective scan (pretty standard)
+                        if kIsVariableC:
+                            thread_reverse_data[i][1] = dout_vals[i] * (
+                                C_vals[i] if kIsVariableB else C_vals[i] * B_val
+                            )
+                        else:
+                            thread_reverse_data[i][1] = dout_vals[i] * (
+                                C_val if kIsVariableB else C_val * B_val
+                            )
+                    # __syncthreads();
+                    # ^^^^ This is needed here to that we have fully written to shared memory before we start reading from it
+
+                    # We then preform the shuffle to the left
+                    if threadIdx.x == kNThreads - 1:
+                        if chunk == params.n_chunks - 1:
+                            thread_reverse_data[kNItems - 1][0] = 1.0
+                        else:
+                            thread_reverse_data[kNItems - 1][0] = smem_delta_a[
+                                stateIdx + ((chunk + 1) % 2) * params.dstate
+                            ]
+                    else:
+                        thread_reverse_data[kNItems - 1][0] = smem_delta_a[
+                            threadIdx.x + 1 + 2 * params.dstate
+                        ]
+
+                    # Now we preform our selective scans
+                    if chunk > 0 and threadIdx.x % 32 == 0:
+                        # We had saved x from the forward pass (very cheap optimization with huge benefits)
+                        running_prefix = x[(chunk - 1) * params.dstate + stateIdx]
+                    else:
+                        running_prefix = [1, 0]
+
+                    # Forward scan for hidden states
+                    prefix_op = SSMScanPrefixCallbackOp(running_prefix)
+                    self.Ktraits.BlockScanT(smem_scan).InclusiveScan(
+                        thread_data, thread_data, SSMScanOp, prefix_op
+                    )
+
+                    # Reverse scan for gradient propagation
+                    if chunk < params.n_chunks - 1 and threadIdx.x == 0:
+                        running_postfix = smem_running_postfix[stateIdx]
+                    else:
+                        running_postfix = [1, 0]
+                    postfix_op = SSMScanPrefixCallbackOp(running_postfix)
+                    self.Ktraits.BlockScanReverseT(smem_reverse_scan).InclusiveScan(
+                        thread_reverse_data, thread_reverse_data, SSMScanOp, postfix_op
+                    )
+
+                    # Save the running postfix for the next block
+                    if threadIdx.x == 0:
+                        smem_running_postfix[stateIdx] = postfix_op.running_prefix
+
+                    # Alright now its time to calculate the gradient flow to the rest of our parameters
+                    # and our output values
+
+                    # We will start by creating temporary variables which our specific to this thread
+                    dA_val = 0
+                    dBC_val = 0  # This will not be used if B and C are both selective
+                    dB_vals = torch.Tensor([0] * kNItems)
+                    dC_vals = torch.Tensor([0] * kNItems)
+                    for i in range(kNItems):
+                        dx = thread_reverse_data[i][1]
+                        # If B isn't variable then it was already added in with BC_var
+                        # This is the derivative of the hidden state with respect to delta * x
+                        ddelta_u = dx if not kIsVariableB else dx * B_vals[i]
+
+                        # We can then get the gradients for u from d (delta * u)
+                        du_vals[i] += ddelta_u * delta_vals[i]
+
+                        # Now we want to calculate the gradients for delta
+                        # They come from two sources, the expression (delta * u) and also delta * A
+                        # For the second note that exp(delta * A) * x + B (zeta), where zeta = delta * u
+                        # Thus when taking the expression with respect to delta, we get A * exp(delta * A) * x
+
+                        # Here a is just our previous hidden state
+                        if kIsVariableB:
+                            a = thread_data[i][1] - (
+                                B_vals[i] * u_vals[i] * delta_vals[i]
+                            )
+                        else:
+                            a = thread_data[i][1] - (u_vals[i] * delta_vals[i])
+
+                        # You should recognize that this is what I explained above
+                        ddelta_vals[i] = ddelta_u * u_vals[i] + dx * A_val * a
+
+                        # The same goes for A as well
+                        # This is just like the second part of delta
+                        dA_val += dx * delta_vals[i] * a
+
+                        # Now we calculate the gradients for B and C
+                        if not kIsVariableB or not kIsVariableC:
+                            pass
 
                 else:
                     # The same thing as the real case but with complex numbers
