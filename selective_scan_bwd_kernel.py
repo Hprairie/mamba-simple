@@ -6,6 +6,7 @@ from .selective_scan_common import load_input, store_input, load_weight
 from .selective_scan_common import SSMScanOp, SSMScanPrefixCallbackOp
 from .cub import GPUPrefixScan
 from .reverse_scan import GPUPostfixScan
+from .aten_gpu_atomic_add import gpuAtomicAdd
 
 
 # ------------------- Selective_scan_bwd_kernel_traits -------------------
@@ -440,7 +441,25 @@ class selective_scan_bwd_kernel:
 
                         # Now we calculate the gradients for B and C
                         if not kIsVariableB or not kIsVariableC:
-                            pass
+                            if not kIsVariableB:
+                                pass
+                            else:
+                                pass
+                        if kIsVariableB:
+                            dB_vals[i] = dx * delta_vals[i] * u_vals[i]
+                        if kIsVariableC:
+                            dC_vals[i] = dx * delta_vals[i] * B_vals[i]
+
+                    # Alright now that we have calculated the gradients for the hidden state,
+                    # we need to store them to memory. One thing that should be noted is that
+                    # there will be multiple stream's of gradients from other blocks running
+                    # on the gpu, which will all go to the same memory location. Thus we need
+                    # to be careful to not overwrite the gradients, and to accumulate them at
+                    # that memory location
+
+                    # Fortunately there are already tools for this in cuda, some of which are
+                    # part of the Pytorch package. gpuAtomicAdd operations, will allow
+                    # us to accumulate the gradients at a given memory location.
 
                 else:
                     # The same thing as the real case but with complex numbers
